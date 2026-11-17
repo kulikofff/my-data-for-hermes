@@ -11,6 +11,8 @@ app = FastAPI()
 # Настройка портов для разных моделей (поменяйте 13306 на нужный порт переводчика, если он отличается)
 GENERAL_COMPLETION_URL = "http://127.0.0.1:13305/v1/chat/completions"
 TRANSLATE_COMPLETION_URL = "http://127.0.0.1:13306/v1/chat/completions"
+NEMOTRON_URL = "http://127.0.0.1:8787/v1/chat/completions"
+
 
 def make_openai_response(text_content: str):
     return {
@@ -36,6 +38,28 @@ def make_openai_response(text_content: str):
         }
     }
 
+
+async def fetch_backend_response(target_url: str, payload: dict) -> str:
+    custom_timeout = httpx.Timeout(connect=10.0, read=None, write=10.0, pool=10.0)
+    async with httpx.AsyncClient(trust_env=False, timeout=custom_timeout) as client:
+        print(f"⏳ Ожидание ответа от {target_url} (max_tokens={payload['max_tokens']})...")
+        response = await client.post(target_url, json=payload)
+        print(f"📡 Статус ответа от сервера ({target_url}): {response.status_code}")
+
+        if response.status_code == 200:
+            result = response.json()
+            try:
+                text_out = result["choices"][0]["message"]["content"].strip()
+            except (KeyError, IndexError, TypeError):
+                text_out = result.get("content", result.get("response", str(result))).strip()
+            print(f"✅ Успешный ответ. Сырой текст: ===\n{text_out}\n===")
+            return text_out
+        else:
+            err_msg = f"❌ Ошибка бэкенда (код {response.status_code}): {response.text}"
+            print(err_msg)
+            return err_msg
+
+
 @app.post("/chat/completions")
 @app.post("/v1/chat/completions")
 @app.post("/mcp/chat/completions")
@@ -44,6 +68,7 @@ async def handle_chat_completions(request: Request):
     try:
         body = await request.json()
         messages = body.get("messages", [])
+        is_streaming = body.get("stream", True)
         
         user_prompt = ""
         for msg in reversed(messages):
@@ -51,84 +76,100 @@ async def handle_chat_completions(request: Request):
                 user_prompt = msg.get("content", "")
                 break
         
-        print(f"\n🤖 Перехвачен запрос от Hermes. Последняя фраза: '{user_prompt}'")
+        print(f"\n🤖 Перехвачен запрос от Hermes (stream={is_streaming}). Последняя фраза: '{user_prompt}'")
         user_prompt_lower = user_prompt.lower()
 
         translate_keywords = ["переведи", "перевод", "перевести", "translate", "translation", "на английский", "на русский"]
+        nemotron_keywords = ["nemotron"]
         
         if any(word in user_prompt_lower for word in translate_keywords):
             target_url = TRANSLATE_COMPLETION_URL
             print(f"🌐 Маршрутизация: Запрос на ПЕРЕВОД отправлен на {target_url}")
+        elif any(word in user_prompt_lower for word in nemotron_keywords):
+            target_url = NEMOTRON_URL
+            print(f"🌐 Маршрутизация: Запрос на Nemotron CPU отправлен на {target_url}")
         else:
             target_url = GENERAL_COMPLETION_URL
             print(f"📝 Маршрутизация: ОБЩИЙ запрос отправлен на {target_url}")
 
+        current_max_tokens = 2048 if target_url == NEMOTRON_URL else 32768
+
         llama_payload = {
             "messages": messages, 
             "temperature": 0.2, 
-            "max_tokens": 2048,  
+            "max_tokens": current_max_tokens,  
             "stream": False,
             "chat_template_kwargs": {"enable_thinking": False}
         }
-        
-        async with httpx.AsyncClient() as client:
-            try:
-                response = await client.post(target_url, json=llama_payload, timeout=300.0)
-                print(f"📡 Статус ответа от сервера ({target_url}): {response.status_code}")
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    
-                    try:
-                        text_out = result["choices"][0]["message"]["content"].strip()
-                    except (KeyError, IndexError, TypeError):
-                        text_out = result.get("content", "").strip()
-                    
-                    print(f"✅ Успешный ответ. Сырой текст: ===\n{text_out}\n===")
-                    
-                    is_streaming = body.get("stream", True)
-                    
-                    if is_streaming:
-                        async def openai_stream_generator(text: str):
-                            chunks = text.split(" ")
-                            for i, chunk in enumerate(chunks):
-                                current_text = chunk + (" " if i < len(chunks) - 1 else "")
-                                chunk_data = {
-                                    "id": "chatcmpl-local-router",
-                                    "object": "chat.completion.chunk",
-                                    "created": 1700000000,
-                                    "model": "local-router",
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {"content": current_text},
-                                            "finish_reason": None
-                                        }
-                                    ]
-                                }
-                                yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
-                                await asyncio.sleep(0.01)
-                            
-                            final_chunk = {
-                                "id": "chatcmpl-local-router",
-                                "object": "chat.completion.chunk",
-                                "created": 1700000000,
-                                "model": "local-router",
-                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                            }
-                            yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
-                            yield "data: [DONE]\n\n"
 
-                        return StreamingResponse(openai_stream_generator(text_out), media_type="text/event-stream")
-                    else:
-                        return JSONResponse(content=make_openai_response(text_out))
+        if is_streaming:
+            async def openai_stream_generator():
+                # Запускаем запрос к модели в фоновой задаче
+                task = asyncio.create_task(fetch_backend_response(target_url, llama_payload))
                 
-                print(f"❌ Сервер вернул ошибку {response.status_code}")
-                return JSONResponse(content=make_openai_response(f"❌ Ошибка бэкенда (код {response.status_code})"))
+                # Пока модель думает, каждые 5 секунд шлем пустой чанк, чтобы Hermes не разорвал соединение
+                while not task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        keepalive_chunk = {
+                            "id": "chatcmpl-local-router",
+                            "object": "chat.completion.chunk",
+                            "created": 1700000000,
+                            "model": "local-router",
+                            "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": None}]
+                        }
+                        yield f"data: {json.dumps(keepalive_chunk, ensure_ascii=False)}\n\n"
+                    except Exception:
+                        break
+
+                try:
+                    text_out = await task
+                except Exception as e:
+                    print(f"💥 ИСКЛЮЧЕНИЕ ПРИ HTTP ЗАПРОСЕ: {str(e)}")
+                    print(traceback.format_exc())
+                    text_out = f"❌ Ошибка связи с моделью: {str(e)}"
+
+                # Отдаем полученный текст порциями
+                chunks = text_out.split(" ")
+                for i, chunk in enumerate(chunks):
+                    current_text = chunk + (" " if i < len(chunks) - 1 else "")
+                    chunk_data = {
+                        "id": "chatcmpl-local-router",
+                        "object": "chat.completion.chunk",
+                        "created": 1700000000,
+                        "model": "local-router",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": current_text},
+                                "finish_reason": None
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+                    await asyncio.sleep(0.01)
+                
+                final_chunk = {
+                    "id": "chatcmpl-local-router",
+                    "object": "chat.completion.chunk",
+                    "created": 1700000000,
+                    "model": "local-router",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }
+                yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+                print("📤 Поток ответа успешно передан в Hermes.")
+
+            return StreamingResponse(openai_stream_generator(), media_type="text/event-stream")
+        else:
+            try:
+                text_out = await fetch_backend_response(target_url, llama_payload)
             except Exception as e:
                 print(f"💥 ИСКЛЮЧЕНИЕ ПРИ HTTP ЗАПРОСЕ: {str(e)}")
                 print(traceback.format_exc())
-                return JSONResponse(content=make_openai_response(f"❌ Ошибка связи с моделью: {str(e)}"))
+                text_out = f"❌ Ошибка связи с моделью: {str(e)}"
+            return JSONResponse(content=make_openai_response(text_out))
 
     except Exception as e:
         print(f"💥 КРИТИЧЕСКАЯ ОШИБКА В РОУТЕРЕ: {str(e)}")
