@@ -1,0 +1,1 @@
+C:\Users\Andrey\Desktop\llama-b10358-bin-win-vulkan-x64\llama-server -m C:\Users\Andrey\Desktop\llama-b10358-bin-win-vulkan-x64\models\google_gemma-4-26B-A4B-it-IQ2_XXS2.gguf --port 13305 --ctx_size 96000  --batch-size 32 -ngl 99 --cache-type-k q8_0 --cache-type-v q8_0

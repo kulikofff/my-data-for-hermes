@@ -1,0 +1,1 @@
+C:\Users\Andrey\Desktop\llama-b10358-bin-win-vulkan-x64\llama-server -m C:\Users\Andrey\Desktop\llama-b10358-bin-win-vulkan-x64\models\index-translate-9b-iq4_xs-imat.gguf --port 13306 --ctx_size 96000  --batch-size 32 -ngl 99 --cache-type-k q8_0 --cache-type-v q8_0
